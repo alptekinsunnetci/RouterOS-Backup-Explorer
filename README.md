@@ -210,4 +210,4 @@ The EC-SRP5 credential scheme was confirmed against:
 - Margin Research — "MikroTik Authentication Revealed": <https://margin.re/2022/02/mikrotik-authentication-revealed/>
 - hashcat issue #4070: <https://github.com/hashcat/hashcat/issues/4070>
 - POC (curve constants): <https://github.com/kyzminskiy/POC-brute-hashes-from-MikroTik-backups>
-- Field names cross-referenced with the official RouterOS documentation: <https://help.mikrotik.com/docs/spaces/ROS/>
+- Field names cross-referenced with the official RouterOS documentation: <https://help.mikrotik.com/docs/>
