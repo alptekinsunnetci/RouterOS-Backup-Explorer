@@ -199,7 +199,9 @@ limited to):
   commercial software.**
 
 You are solely responsible for ensuring that your use of this tool is lawful and authorized.
+
 If in doubt, don't.
+
 
 ---
 
