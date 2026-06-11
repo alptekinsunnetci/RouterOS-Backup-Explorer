@@ -1,6 +1,6 @@
-# MikroTik RouterOS Backup Explorer
+# MikroTik RouterOS Backup Decoder
 
-> **Why this exists**
+> **Why this exists (the honest story)**
 >
 > One day all I had was a RouterOS `.backup` file — no `/export` `.rsc`, no live access to
 > the router, just the binary blob. I needed to actually *see* the configuration inside it
@@ -15,6 +15,25 @@
 > the configuration is decoded into clean, human-readable fields; the rest is still shown by
 > its raw numeric id or enum code. See [Limitations](#limitations). I'd rather show an
 > honest "I don't know what this id means yet" than guess and mislead you.
+
+---
+
+## ⚠️ Status & scope (read this)
+
+- **Experimental and unsupported.** This is an independently reverse-engineered hobby tool.
+  It is **not** affiliated with, endorsed by, or supported by MikroTik. There is no warranty,
+  no support, and no roadmap. Use it at your own risk.
+- **Authorized systems only.** Use it strictly on backups of devices **you own** or are
+  **explicitly authorized in writing** to analyze. Nothing here is intended to facilitate
+  access to systems you do not control.
+- **No version-compatibility guarantee.** The format was inferred from specific RouterOS
+  backups. Field meanings, ids, and enum codes **vary between RouterOS versions** and may be
+  wrong or incomplete for yours. Treat every decoded value as best-effort, not authoritative.
+- **Not a credential-recovery or security-bypass tool.** Decoding the configuration does
+  **not** require any password. The optional password *verification* utility only checks a
+  password you already believe is yours against your own backup — it cannot reveal, recover,
+  or bypass anything (the stored value is a one-way verifier). Using it, or this tool, to
+  obtain access you are not entitled to is out of scope and prohibited (see Disclaimer).
 
 ---
 
@@ -33,7 +52,7 @@ against the **EC-SRP5** credential scheme RouterOS uses (see below).
 
 **Forensics, auditing, and backup analysis** — for example:
 
-- Recovering/inspecting **your own** configuration when all you have is the backup file.
+- Inspecting **your own** configuration when all you have is the backup file.
 - Auditing what is actually stored in a backup (users, firewall rules, BGP peers, addresses…).
 - Comparing two backups, or migrating settings, without a running router.
 
@@ -98,9 +117,20 @@ mikrotik-backup [-out prefix] [-password pass] [-wordlist file] <backup-file>
 | `-out <prefix>` | Output file prefix. Writes `<prefix>.json` and `<prefix>.txt`. Default: `output`. |
 | `-password <pass>` | Password for **RC4-encrypted** backups (older RouterOS). |
 | `-wordlist <file>` | Audit user passwords against this wordlist (EC-SRP5). |
+| `-all` | Show **all** fields, including unnamed defaults (`false`/`0`/empty). |
 
 If `-wordlist` is not given but a file named `wordlist.txt` exists in the working directory,
 it is used automatically.
+
+**Concise by default.** Most of a record's raw properties are noise. By default the tool:
+
+- **omits unnamed fields at their default** (`false` / `0` / empty), and
+- **omits unnamed fields that hold the same value across a store's records** (uniform
+  internal/structural defaults — e.g. an unchanging limit present on every firewall rule, or
+  identical ethernet settings on every interface).
+
+Named fields are always shown (even at default). Nothing is guessed or renamed — hidden
+fields are simply uninformative. Use **`-all`** for the full, unfiltered forensic dump.
 
 ### Examples
 
@@ -161,9 +191,12 @@ stored = u (32 bytes) || (Y & 1)            # x-coordinate + y-parity
 ```
 
 This verifier **cannot be reversed** to the plaintext (that would require solving the
-elliptic-curve discrete-log problem). The `-wordlist` mode therefore only **verifies**
-candidates: it recomputes the verifier for each candidate password and compares. This is
-intended for recovering **your own** forgotten password from **your own** backup.
+elliptic-curve discrete-log problem) — the tool cannot reveal or recover a password. The
+optional `-wordlist` mode only **checks** candidates you supply: it recomputes the verifier
+for each candidate and reports whether one matches. It is a *verification* convenience for
+confirming a password you already believe is correct on **your own** backup — not a cracker,
+recovery, or bypass tool. It is entirely separate from (and not needed for) decoding the
+configuration.
 
 ---
 
@@ -171,11 +204,14 @@ intended for recovering **your own** forgotten password from **your own** backup
 
 - **Not a 1:1 config reconstruction.** Roughly a third of all property ids are currently
   mapped to names; the rest are shown by their raw `0xNNNNNN` id.
-- **Enum/bitmask values are not fully decoded.** Some fields are correctly *named*
-  (e.g. `ipsec` `enc-algorithm`, `dh-group`, `hash-algorithm`; queue `kind`; firewall
-  `action`) but their values are still shown as the internal numeric code rather than the
-  readable name (`aes-128`, `modp2048`, `red`, …). I simply haven't reverse-engineered
-  those enum tables yet.
+- **Enums are partially decoded.** Common, confirmed enums are rendered as readable names —
+  firewall `protocol` (`tcp`/`udp`/…), `action` (`accept`/`drop`), queue `kind`
+  (`pfifo`/`red`/`sfq`/`pcq`/…), logging `target`, and DHCP option `code`. The forensic
+  text view shows both (`tcp (6)`); the JSON view shows the clean label.
+  **Bitmask-style** fields are *named* but still show their raw code — e.g. `ipsec`
+  `enc-algorithm` / `dh-group` / `hash-algorithm` (a single value encodes a *set* of
+  algorithms, which can't be reversed reliably from one sample). I haven't reverse-engineered
+  those bitmask tables.
 - **Encryption:** plaintext backups are fully supported and tested. RC4 decryption is
   implemented per the documented scheme. **AES**-encrypted backups (newer RouterOS) are
   detected but **not** decoded.
@@ -199,9 +235,7 @@ limited to):
   commercial software.**
 
 You are solely responsible for ensuring that your use of this tool is lawful and authorized.
-
 If in doubt, don't.
-
 
 ---
 
@@ -212,4 +246,4 @@ The EC-SRP5 credential scheme was confirmed against:
 - Margin Research — "MikroTik Authentication Revealed": <https://margin.re/2022/02/mikrotik-authentication-revealed/>
 - hashcat issue #4070: <https://github.com/hashcat/hashcat/issues/4070>
 - POC (curve constants): <https://github.com/kyzminskiy/POC-brute-hashes-from-MikroTik-backups>
-- Field names cross-referenced with the official RouterOS documentation: <https://help.mikrotik.com/docs/>
+- Field names cross-referenced with the official RouterOS documentation: <https://help.mikrotik.com/docs/spaces/ROS/>
