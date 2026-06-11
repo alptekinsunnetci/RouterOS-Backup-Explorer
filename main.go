@@ -1,4 +1,4 @@
-// MikroTik RouterOS backup (.backup) Explorer.
+// MikroTik RouterOS backup (.backup) decoder.
 //
 // Parses the binary container produced by `/system backup save` and the
 // internal "store" / item ("M2") serialization that holds the actual
@@ -57,6 +57,143 @@ const (
 	magicRC4       uint32 = 0x7291A8EF
 )
 
+// showAll, when set via -all, keeps unnamed fields that sit at their default
+// (false / 0 / empty). By default those are hidden to cut noise — most of a
+// record's properties are unset defaults that carry no information.
+var showAll bool
+
+// isDefaultValue reports whether a raw property value is an empty/zero default.
+func isDefaultValue(v interface{}) bool {
+	switch x := v.(type) {
+	case nil:
+		return true
+	case bool:
+		return !x
+	case uint64:
+		return x == 0
+	case string:
+		return x == ""
+	case []Property:
+		return len(x) == 0
+	case []interface{}:
+		return len(x) == 0
+	}
+	return false
+}
+
+// hidden reports whether a property should be omitted from output: an unnamed
+// field at its default value, unless -all was given.
+func hidden(p Property) bool {
+	return !showAll && p.Name == "" && isDefaultValue(p.Value)
+}
+
+func isScalar(v interface{}) bool {
+	switch v.(type) {
+	case bool, uint64, string:
+		return true
+	}
+	return false
+}
+
+// pruneConstantFields drops unnamed scalar fields that hold the *same* value in
+// every record of a multi-record store. Such fields are internal/structural
+// defaults (e.g. an unchanging limit on every rule, or identical ethernet
+// settings across every interface), not per-record configuration, so hiding
+// them removes a lot of noise without guessing names. It also recurses into the
+// per-record nested message. Skipped under -all.
+func pruneConstantFields(b *Backup) {
+	for si := range b.Stores {
+		recs := b.Stores[si].Records
+		if len(recs) < 3 {
+			continue
+		}
+		lists := make([][]Property, len(recs))
+		for i := range recs {
+			lists[i] = recs[i].Properties
+		}
+		lists = pruneLists(lists)
+		for i := range recs {
+			recs[i].Properties = lists[i]
+		}
+	}
+}
+
+// pruneLists removes unnamed scalar fields that are identical across all the
+// given property lists, then recurses into nested messages that occur once in
+// every list. Returns the pruned lists.
+func pruneLists(lists [][]Property) [][]Property {
+	n := len(lists)
+	if n < 3 {
+		return lists
+	}
+	type acc struct {
+		val      interface{}
+		count    int
+		constant bool
+	}
+	scal := map[string]*acc{}
+	msgCount := map[string]int{}
+	for _, props := range lists {
+		for _, p := range props {
+			if p.Name != "" {
+				continue
+			}
+			if isScalar(p.Value) {
+				if a, ok := scal[p.ID]; ok {
+					a.count++
+					if a.val != p.Value {
+						a.constant = false
+					}
+				} else {
+					scal[p.ID] = &acc{p.Value, 1, true}
+				}
+			} else if _, ok := p.Value.([]Property); ok {
+				msgCount[p.ID]++
+			}
+		}
+	}
+	drop := map[string]bool{}
+	for id, a := range scal {
+		// An unnamed field that holds one and the same value everywhere it
+		// appears (in at least 3 records) is a uniform internal default, not
+		// per-record configuration.
+		if a.constant && a.count >= 3 {
+			drop[id] = true
+		}
+	}
+	nested := map[string][][]Property{}
+	for id, c := range msgCount {
+		if c != n {
+			continue
+		}
+		nl := make([][]Property, n)
+		for i, props := range lists {
+			for _, p := range props {
+				if p.ID == id {
+					nl[i], _ = p.Value.([]Property)
+					break
+				}
+			}
+		}
+		nested[id] = pruneLists(nl)
+	}
+	out := make([][]Property, n)
+	for i, props := range lists {
+		var kept []Property
+		for _, p := range props {
+			if p.Name == "" && drop[p.ID] {
+				continue
+			}
+			if np, ok := nested[p.ID]; ok {
+				p.Value = np[i]
+			}
+			kept = append(kept, p)
+		}
+		out[i] = kept
+	}
+	return out
+}
+
 // ---------------------------------------------------------------- output model
 
 type Property struct {
@@ -100,6 +237,7 @@ var propNames = map[uint32]string{
 	0xfe0001: ".id",
 	0xfe0009: "comment",
 	0xfe000a: "disabled",
+	0xfe000d: ".default", // builtin/default item flag (true only on built-ins)
 	0xfe0010: "name",
 	0xfeff20: "address",
 	0xfeff25: "prefix-length",
@@ -160,9 +298,12 @@ var storePropNames = map[string]map[uint32]string{
 	},
 	// Firewall/routing address lists (/ip/firewall/address-list): each entry is
 	// stored as an inclusive [start,end] range (e.g. .96-.103 for a /29).
+	// 0x0a is a unix creation timestamp; 0x09 is the (none) timeout sentinel.
 	"net/address-list": {
 		0x000003: "range-start",
 		0x000004: "range-end",
+		0x000009: "timeout",
+		0x00000a: "creation-time",
 	},
 	// Interfaces (/interface). 0x010009 and 0x010030 carry the same MAC per
 	// record (configured vs. hardware).
@@ -185,9 +326,13 @@ var storePropNames = map[string]map[uint32]string{
 		0x00001b: "src-address",
 		0x00001e: "engine-id",
 	},
-	// SNMP communities (/snmp community); the community string is its name.
+	// SNMP communities (/snmp community): name="public", read-access=yes,
+	// write-access=no, addresses=213.238.170.48 (confirmed against export).
 	"snmp-communities": {
 		0x000005: "name",
+		0x000006: "read-access",
+		0x000007: "write-access",
+		0x000008: "addresses",
 	},
 	// DNS resolver (/ip dns). All non-default-looking fields verified against the
 	// official property table (defaults: cache 2048, udp 4096, timeouts 2s/10s,
@@ -339,6 +484,8 @@ var nonIPNames = map[string]bool{
 	"as":            true, // AS numbers can look like IPs (e.g. 215749 -> 197.74.3.0)
 	"remote.as":     true,
 	"lifetime":      true, // durations (e.g. 86400 -> 128.81.1.0)
+	"creation-time": true, // unix timestamps
+	"timeout":       true,
 }
 
 // ipFieldNames are named numeric fields that always hold an IPv4 address, so
@@ -360,6 +507,79 @@ var ipFieldNames = map[string]bool{
 	"dst-address-to": true,
 }
 
+// enumNames maps a named field to the readable label for its numeric codes.
+// Keyed by field name (the same field name carries the same enum across stores).
+// Only mappings confirmed against /export verbose or fixed standards (IANA
+// protocol numbers, DHCP option codes) are included; unlisted codes fall back to
+// the raw number.
+var enumNames = map[string]map[uint64]string{
+	// IANA / RouterOS IP protocol numbers.
+	"protocol": {
+		1: "icmp", 2: "igmp", 4: "ipencap", 6: "tcp", 17: "udp", 41: "ipv6",
+		46: "rsvp", 47: "gre", 50: "ipsec-esp", 51: "ipsec-ah", 58: "icmpv6",
+		89: "ospf", 103: "pim", 112: "vrrp", 115: "l2tp", 132: "sctp",
+	},
+	// /queue type kind (derived from the 10 built-in queue types vs export).
+	"kind": {2: "pfifo", 3: "red", 4: "sfq", 5: "pcq", 6: "mq-pfifo", 7: "none"},
+	// /ip firewall raw action (confirmed: accept=0, drop=3).
+	"action": {0: "accept", 3: "drop"},
+	// /system logging action target (confirmed against export).
+	"target": {0: "memory", 1: "disk", 2: "echo", 3: "remote"},
+	// /ip dhcp-client option code (DHCP option numbers).
+	"code": {
+		12: "hostname", 51: "lease-time", 60: "vendor-class-id",
+		61: "client-id", 66: "tftp-server", 67: "boot-file-name",
+		121: "classless-route",
+	},
+	// Switch QoS tx-manager queue schedule (confirmed against export).
+	"schedule": {0: "strict-priority", 1: "low-priority-group", 2: "high-priority-group"},
+}
+
+// bitmaskNames decode integer bitmask fields into a comma-separated flag list.
+// The slice index is the bit position; "" marks an unused bit. The user-group
+// policy map is verified against all three built-in groups (read/write/full).
+var bitmaskNames = map[string][]string{
+	"policy": {
+		"", "local", "telnet", "ssh", "ftp", "reboot", "read", "write", "policy",
+		"test", "winbox", "password", "web", "sniff", "sensitive", "api", "romon",
+		"dude", "tikapp", "rest-api",
+	},
+	"pcq-classifier": {"src-address", "dst-address", "src-port", "dst-port"},
+}
+
+// decodeBitmask renders a bitmask field as its set flags, if the field is known.
+func decodeBitmask(name string, v interface{}) (string, bool) {
+	n, ok := v.(uint64)
+	if !ok {
+		return "", false
+	}
+	bits, ok := bitmaskNames[name]
+	if !ok {
+		return "", false
+	}
+	var out []string
+	for i, nm := range bits {
+		if nm != "" && n&(1<<uint(i)) != 0 {
+			out = append(out, nm)
+		}
+	}
+	return strings.Join(out, ","), true
+}
+
+// enumLabel returns the readable label for a named field's numeric value, if known.
+func enumLabel(name string, v interface{}) (string, bool) {
+	n, ok := v.(uint64)
+	if !ok {
+		return "", false
+	}
+	if m, ok := enumNames[name]; ok {
+		if lbl, ok := m[n]; ok {
+			return lbl, true
+		}
+	}
+	return "", false
+}
+
 // ipv4For returns the dotted-quad rendering for a u32 property value, honoring
 // the per-name overrides above.
 func ipv4For(name string, v uint32) string {
@@ -372,18 +592,30 @@ func ipv4For(name string, v uint32) string {
 	return ipv4Hint(v)
 }
 
-// lookupName resolves a property name from the global table, falling back to
-// the per-store table only for a record's top-level fields (depth == 0).
+// nestedPropNames names fields that live inside a store's nested message
+// (depth > 0), where storePropNames (depth 0) does not apply. Used for the
+// per-interface ethernet config inside net/devices.
+var nestedPropNames = map[string]map[uint32]string{
+	"net/devices": {
+		0x0003e9: "mac-address",
+		0x000404: "orig-mac-address",
+		0x000419: "loop-protect-disable-time",
+		0x010067: "max-l2mtu",
+	},
+}
+
+// lookupName resolves a property name from the global table, then the per-store
+// table (record top level, depth 0) or the nested table (depth > 0).
 func lookupName(store string, depth int, id uint32) string {
 	if n, ok := propNames[id]; ok {
 		return n
 	}
 	if depth == 0 {
-		if m, ok := storePropNames[store]; ok {
-			if n, ok := m[id]; ok {
-				return n
-			}
+		if n, ok := storePropNames[store][id]; ok {
+			return n
 		}
+	} else if n, ok := nestedPropNames[store][id]; ok {
+		return n
 	}
 	return ""
 }
@@ -401,11 +633,13 @@ func main() {
 	out := flag.String("out", "output", "output file prefix (writes <prefix>.json and <prefix>.txt)")
 	password := flag.String("password", "", "password for encrypted backups")
 	wordlist := flag.String("wordlist", "", "audit user passwords against this wordlist file (EC-SRP5)")
+	all := flag.Bool("all", false, "show all fields, including unnamed defaults (false/0/empty)")
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: mikrotik-backup [-out prefix] [-password pass] <backup-file>")
+		fmt.Fprintln(os.Stderr, "usage: mikrotik-backup [-out prefix] [-password pass] [-all] <backup-file>")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	showAll = *all
 
 	args := flag.Args()
 	if len(args) < 1 {
@@ -466,6 +700,9 @@ func main() {
 
 	backup.Stores = parseStores(storeData)
 	resolveRelations(&backup)
+	if !showAll {
+		pruneConstantFields(&backup)
+	}
 	backup.StoreCount = len(backup.Stores)
 	for _, s := range backup.Stores {
 		if s.RecordCount > 0 {
@@ -1086,6 +1323,9 @@ func buildCleanJSON(b *Backup) jsonOut {
 func cleanFields(props []Property) map[string]interface{} {
 	m := make(map[string]interface{}, len(props))
 	for _, p := range props {
+		if hidden(p) {
+			continue
+		}
 		key := p.Name
 		if key == "" {
 			key = p.ID
@@ -1122,6 +1362,12 @@ func cleanValue(p Property) interface{} {
 		}
 		return out
 	case uint64:
+		if lbl, ok := decodeBitmask(p.Name, v); ok { // flag list, e.g. policy
+			return lbl
+		}
+		if lbl, ok := enumLabel(p.Name, v); ok { // readable enum, e.g. tcp / drop
+			return lbl
+		}
 		if p.Note != "" { // resolved reference, e.g. group: full
 			if name, ok := strings.CutPrefix(p.Note, "group: "); ok {
 				return name
@@ -1171,6 +1417,9 @@ func renderText(b *Backup) string {
 func renderProps(sb *strings.Builder, props []Property, depth int) {
 	indent := strings.Repeat("  ", depth)
 	for _, p := range props {
+		if hidden(p) {
+			continue
+		}
 		label := p.Name
 		if label == "" {
 			label = p.ID
@@ -1183,7 +1432,7 @@ func renderProps(sb *strings.Builder, props []Property, depth int) {
 			fmt.Fprintf(sb, "%s%s [%s] (%d)%s\n", indent, label, p.Type, len(v), hintSuffix(p))
 			renderArray(sb, v, depth+1)
 		default:
-			fmt.Fprintf(sb, "%s%s [%s] = %s%s\n", indent, label, p.Type, scalarString(p.Value), hintSuffix(p))
+			fmt.Fprintf(sb, "%s%s [%s] = %s%s\n", indent, label, p.Type, textScalar(p), hintSuffix(p))
 		}
 	}
 }
@@ -1198,6 +1447,18 @@ func renderArray(sb *strings.Builder, items []interface{}, depth int) {
 			fmt.Fprintf(sb, "%s[%d] = %s\n", indent, k, scalarString(it))
 		}
 	}
+}
+
+// textScalar renders a scalar for the forensic text view, showing a decoded
+// enum label alongside its raw code (e.g. "tcp (6)").
+func textScalar(p Property) string {
+	if lbl, ok := decodeBitmask(p.Name, p.Value); ok {
+		return fmt.Sprintf("%s (%v)", lbl, p.Value)
+	}
+	if lbl, ok := enumLabel(p.Name, p.Value); ok {
+		return fmt.Sprintf("%s (%v)", lbl, p.Value)
+	}
+	return scalarString(p.Value)
 }
 
 func scalarString(v interface{}) string {
@@ -1233,7 +1494,7 @@ func hintSuffix(p Property) string {
 // ---------------------------------------------------------------- summary
 
 func printSummary(b *Backup, prefix string) {
-	fmt.Println("MikroTik RouterOS Backup Explorer")
+	fmt.Println("MikroTik RouterOS backup decoder")
 	fmt.Printf("File:   %s (%d bytes)\n", b.File, b.Size)
 	status := "OK"
 	if !b.LengthOK {
